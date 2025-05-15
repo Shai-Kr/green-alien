@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Alien Chat for Ari (Stable Auto)</title>
+  <title>Alien Chat for Ari (No Abort Errors!)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
   <style>
     html, body {
@@ -137,18 +137,36 @@ const mouth = document.getElementById('mouth');
 const errorDiv = document.getElementById('errormsg');
 const startOverlay = document.getElementById('startOverlay');
 
-const OPENAI_API_KEY = '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';
+// **** Put your API KEY here ****
+const OPENAI_API_KEY = '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';
 
 let recognition, recognizing = false;
+let pendingRecognition = false; // <--- NEW
 let autoMode = true;
 let lastAudio = null;
 let userInteracted = false;
 let mouthAnimating = false;
+const MAX_TTS_CHARS = 400;
+
+// Context: last 5 user+AI turns (max 10 items)
+let conversationHistory = [];
 
 function setMouthClosed() {
   mouth.setAttribute('height', 15);
   mouth.setAttribute('y', 105);
 }
+
+function cleanTTS(text) {
+  return text
+    .replace(/[\u{1F600}-\u{1F6FF}]/gu, '') // emoticons
+    .replace(/[*_`~#>\[\]]/g, '') // markdown chars
+    .replace(/\n{2,}/g, '\n')
+    .replace(/\s{2,}/g, ' ')
+    .slice(0, MAX_TTS_CHARS);
+}
+
+let lastMicErrorRetry = 0;
+let lastTTSErrorRetry = 0;
 
 function animateMouthWhileTalking(audio) {
   mouthAnimating = true;
@@ -168,16 +186,19 @@ function animateMouthWhileTalking(audio) {
   audio.onended = () => {
     mouthAnimating = false;
     setMouthClosed();
-    // תן delay קצר, ואז המשך האזנה (אם אוטומטי)
     if (autoMode && userInteracted) {
-      setTimeout(() => {
-        try { if (recognition) recognition.abort(); } catch(e){}
-        startRecognition();
-      }, 800);
+      setTimeout(() => { startRecognition(); }, 800);
     }
+  };
+  audio.onerror = () => {
+    errorDiv.textContent = "Audio playback error";
+    mouthAnimating = false;
+    setMouthClosed();
+    if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
   };
 }
 
+// --------- SpeechRecognition Setup ---------
 if ('webkitSpeechRecognition' in window) {
   recognition = new webkitSpeechRecognition();
   recognition.continuous = false;
@@ -186,6 +207,7 @@ if ('webkitSpeechRecognition' in window) {
 
   recognition.onstart = function() {
     recognizing = true;
+    pendingRecognition = false; // <-- reset flag
     micBtn.classList.add('active');
     micBtn.innerText = "🔁 Listening (auto)";
     transcriptDiv.textContent = '';
@@ -197,27 +219,41 @@ if ('webkitSpeechRecognition' in window) {
     const speechResult = event.results[0][0].transcript;
     transcriptDiv.textContent = speechResult;
     recognizing = false;
+    pendingRecognition = false;
     micBtn.classList.remove('active');
     micBtn.innerText = "🔁 Listening (auto)";
     setMouthClosed();
     mouthAnimating = false;
-    askOpenAI(speechResult);
+
+    conversationHistory.push({ role: "user", content: speechResult });
+    if (conversationHistory.length > 10) conversationHistory = conversationHistory.slice(-10);
+
+    askOpenAI();
   };
   recognition.onerror = function(event) {
     transcriptDiv.textContent = "Error: " + event.error;
     errorDiv.textContent = "Mic error: " + event.error;
     recognizing = false;
+    pendingRecognition = false;
     micBtn.classList.remove('active');
     micBtn.innerText = "🔁 Listening (auto)";
     setMouthClosed();
     mouthAnimating = false;
-    if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+    let now = Date.now();
+    if (
+      (autoMode && userInteracted && now - lastMicErrorRetry > 1800) &&
+      event.error !== "not-allowed"
+    ) {
+      lastMicErrorRetry = now;
+      setTimeout(() => { startRecognition(); }, 1800);
+    }
   };
   recognition.onend = function() {
     recognizing = false;
+    pendingRecognition = false;
     setMouthClosed();
     mouthAnimating = false;
-    if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+    if (autoMode && userInteracted) setTimeout(() => { startRecognition(); }, 1500);
   };
 } else {
   micBtn.disabled = true;
@@ -225,16 +261,20 @@ if ('webkitSpeechRecognition' in window) {
   errorDiv.textContent = "This browser does not support speech recognition.";
 }
 
+// THE FIX: Use a queue and delay for recognition
 function startRecognition() {
   if (!recognition) return;
-  try { recognition.abort(); } catch(e){}
-  if (!recognizing) {
-    setTimeout(() => {
-      setMouthClosed();
-      mouthAnimating = false;
-      recognition.start();
-    }, 150); // דיליי קטן למניעת התנגשויות
-  }
+  if (recognizing || pendingRecognition) return;
+  pendingRecognition = true;
+  setTimeout(() => {
+    try {
+      if (!recognizing) recognition.start();
+    } catch (e) {
+      errorDiv.textContent = "Mic error: " + e.message;
+      setTimeout(startRecognition, 1800);
+    }
+    pendingRecognition = false;
+  }, 320); // דיליי קטן (קריטי)
 }
 
 micBtn.onclick = function() {
@@ -255,16 +295,24 @@ micBtn.onclick = function() {
   }
 };
 
-async function askOpenAI(text) {
+async function askOpenAI() {
   aiResponseDiv.textContent = "Thinking...";
   errorDiv.textContent = '';
   setMouthClosed();
   mouthAnimating = false;
   try {
-    const systemPrompt = `You are a cheerful, friendly, green alien, inspired by the viral Dame Tu Cosita character. 
-You are talking to a 7-year-old autistic boy named Ari. 
-Your mission is to encourage Ari to speak and communicate. 
-Be playful, positive, simple, and make every answer sound fun and supportive.`;
+    const systemPrompt = `
+You are a cheerful, friendly, green alien inspired by the viral Dame Tu Cosita character.
+You are talking to a 7-year-old autistic boy named Ari. Your mission is to encourage Ari to speak and communicate.
+You prefer to speak English, but you can also use Hebrew sometimes, especially if Ari does. Most of the time, use English, but occasionally use simple Hebrew words or sentences.
+Very frequently, throw in funny words or short phrases from the Dame Tu Cosita song (like "cosita", "Dame tu cosita", "ahh", "ay!", "ven aquí", etc).
+Always invite Ari to play, repeat words, practice new words and letters, and have fun.
+Make every answer sound playful, supportive, and simple. 
+Sometimes ask Ari to copy what you say, repeat a word, or play a silly language game.
+Never write more than 3 short sentences per message.
+`;
+
+    const shortHistory = conversationHistory.slice(-10);
 
     const openaiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -273,31 +321,39 @@ Be playful, positive, simple, and make every answer sound fun and supportive.`;
         "Authorization": "Bearer " + OPENAI_API_KEY
       },
       body: JSON.stringify({
-        model: "gpt-3.5-turbo",
+        model: "gpt-4o",
         messages: [
           { role: "system", content: systemPrompt },
-          { role: "user", content: text }
+          ...shortHistory
         ]
       })
     }).then(res => res.json());
 
     const answer = openaiResponse.choices?.[0]?.message?.content || "No response";
     aiResponseDiv.textContent = answer;
-    playOpenAITTS(answer, "echo");
+
+    conversationHistory.push({ role: "assistant", content: answer });
+    if (conversationHistory.length > 10) conversationHistory = conversationHistory.slice(-10);
+
+    playOpenAITTS(answer, "coral");
   } catch (err) {
     errorDiv.textContent = "OpenAI error: " + err.message;
-    console.error(err);
     setMouthClosed();
     mouthAnimating = false;
-    if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+    let now = Date.now();
+    if (autoMode && userInteracted && now - lastMicErrorRetry > 1800) {
+      lastMicErrorRetry = now;
+      setTimeout(startRecognition, 1800);
+    }
   }
 }
 
-async function playOpenAITTS(text, voice="echo") {
+async function playOpenAITTS(text, voice="coral") {
   aiResponseDiv.textContent += " (Speaking...)";
   errorDiv.textContent = '';
   setMouthClosed();
   mouthAnimating = false;
+  const cleanedText = cleanTTS(text);
   try {
     if (lastAudio) {
       lastAudio.pause();
@@ -310,8 +366,8 @@ async function playOpenAITTS(text, voice="echo") {
         "Authorization": "Bearer " + OPENAI_API_KEY
       },
       body: JSON.stringify({
-        model: "tts-1",
-        input: text,
+        model: "tts-1-hd",    // <- required for "coral"
+        input: cleanedText,
         voice: voice,
         response_format: "mp3"
       })
@@ -322,7 +378,11 @@ async function playOpenAITTS(text, voice="echo") {
       aiResponseDiv.textContent += " (TTS Error)";
       setMouthClosed();
       mouthAnimating = false;
-      if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+      let now = Date.now();
+      if (autoMode && userInteracted && now - lastTTSErrorRetry > 1200) {
+        lastTTSErrorRetry = now;
+        setTimeout(() => playOpenAITTS(cleanedText, voice), 1200);
+      }
       return;
     }
     const audioData = await response.arrayBuffer();
@@ -335,19 +395,37 @@ async function playOpenAITTS(text, voice="echo") {
       lastAudio = null;
     }
     lastAudio = audio;
-    // << רק כשהאודיו באמת מתחיל – הפה יזוז >>
-    audio.onplay = () => { mouthAnimating = true; animateMouthWhileTalking(audio); };
-    audio.play().catch(err=>{
+
+    audio.onended = () => {
+      mouthAnimating = false;
+      setMouthClosed();
+      if (autoMode && userInteracted) setTimeout(startRecognition, 800);
+    };
+    audio.onerror = () => {
+      errorDiv.textContent = "Audio playback error";
+      mouthAnimating = false;
+      setMouthClosed();
+      if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+    };
+    audio.play().then(() => {
+      mouthAnimating = true;
+      animateMouthWhileTalking(audio);
+    }).catch(err => {
       errorDiv.textContent = "Audio play error: " + err.message;
       setMouthClosed();
       mouthAnimating = false;
       if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
     });
+
   } catch (err) {
     errorDiv.textContent = "TTS Exception: " + err.message;
     setMouthClosed();
     mouthAnimating = false;
-    if (autoMode && userInteracted) setTimeout(startRecognition, 1200);
+    let now = Date.now();
+    if (autoMode && userInteracted && now - lastTTSErrorRetry > 1200) {
+      lastTTSErrorRetry = now;
+      setTimeout(() => playOpenAITTS(cleanTTS(text), voice), 1200);
+    }
   }
 }
 
@@ -364,7 +442,6 @@ startOverlay.addEventListener("click", activateAfterUserTap);
 startOverlay.addEventListener("touchstart", activateAfterUserTap);
 
 setMouthClosed();
-// לא להאזין מיד עד שיש אינטראקציה!
 </script>
 </body>
 </html>
